@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"errors"
 	"sync"
 
 	"golang.org/x/exp/slog"
@@ -71,26 +72,107 @@ func WithLogger[K comparable, V any](l *slog.Logger) Option[K, V] {
 	}
 }
 
+// Pull pulls the elements from the given Cache into this; if the two Caches
+// have some elements in common, the incoming elements replace the existing ones.
+func (c *Cache[K, V]) Pull(other *Cache[K, V]) error {
+	if other == nil {
+		if c.logger != nil {
+			c.logger.Error("merging with nil cache")
+		}
+		return errors.New("invalid cache")
+	}
+
+	if c.logger != nil {
+		c.logger.Debug("pulling other caches elements into this")
+	}
+
+	keys := other.Keys()
+	for _, k := range keys {
+		v, _ := other.Get(k)
+		c.Put(k, v)
+	}
+	if c.logger != nil {
+		c.logger.Debug("dne pulling other caches elements into this")
+	}
+	return nil
+}
+
+// Merge pulls the elements from the given Cache into this; if the two Caches
+// have some elements in common, the existing ones are preserved.
+func (c *Cache[K, V]) Merge(other *Cache[K, V]) error {
+	if other == nil {
+		if c.logger != nil {
+			c.logger.Error("merging with nil cache")
+		}
+		return errors.New("invalid cache")
+	}
+
+	if c.logger != nil {
+		c.logger.Debug("pulling other caches elements into this")
+	}
+
+	keys := other.Keys()
+	for _, k := range keys {
+		v, _ := other.Get(k)
+		c.Put(k, v)
+	}
+	if c.logger != nil {
+		c.logger.Debug("dne pulling other caches elements into this")
+	}
+	return nil
+}
+
 func (c *Cache[K, V]) Store() error {
-	// if c.persistence != nil {
-	// 	data, err := c.encoding.Encode(c.store)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	return c.persistence.Persist(data)
-	// }
+	if c.logger != nil {
+		c.logger.Debug("persisting cache")
+	}
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	if err := c.storeNoLock(true); err != nil {
+		if c.logger != nil {
+			c.logger.Error("error persisting cache", "error", err)
+		}
+		return err
+	}
+	if c.logger != nil {
+		c.logger.Debug("done persisting cache")
+	}
 	return nil
 }
 
 func (c *Cache[K, V]) Load() error {
-	// TODO: load
-	return nil
+	if c.logger != nil {
+		c.logger.Debug("loading cache")
+	}
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	return c.loadNoLock()
 }
 
-// Put stores an element in the cache, possibly replacing and existing
+// Put stores an element in the cache; if ana element already exists, it
+// does not replace it and keeps the previous value.
+func (c *Cache[K, V]) Put(k K, v V) bool {
+	if c.logger != nil {
+		c.logger.Debug("putting value into cache", "key", k, "value", v)
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if _, ok := c.store[k]; !ok {
+		c.store[k] = v
+		if c.logger != nil {
+			c.logger.Debug("value stored into cache", "key", k, "value", v)
+		}
+		c.storeNoLock(false)
+		return true
+	}
+	return false
+}
+
+// Replace stores an element in the cache, possibly replacing an existing
 // one under the same key; it returns whether an elements was already
 // present in the Cache under the same key and, if so, its value.
-func (c *Cache[K, V]) Put(k K, v V) (V, bool) {
+func (c *Cache[K, V]) Replace(k K, v V) (V, bool) {
 	if c.logger != nil {
 		c.logger.Debug("putting value into cache", "key", k, "value", v)
 	}
@@ -98,7 +180,7 @@ func (c *Cache[K, V]) Put(k K, v V) (V, bool) {
 	defer c.lock.Unlock()
 	old, ok := c.store[k]
 	c.store[k] = v
-	c.Store()
+	c.storeNoLock(false)
 	if c.logger != nil {
 		c.logger.Debug("returning previous value from cache", "present", ok, "key", k, "value", old)
 	}
@@ -130,8 +212,9 @@ func (c *Cache[K, V]) Delete(k K) (V, bool) {
 	defer c.lock.Unlock()
 	v, ok := c.store[k]
 	delete(c.store, k)
+	err := c.storeNoLock(false)
 	if c.logger != nil {
-		c.logger.Debug("removed value from cache", "present", ok, "key", k, "value", v)
+		c.logger.Debug("removed value from cache", "present", ok, "key", k, "value", v, "error", err)
 	}
 	return v, ok
 }
@@ -155,8 +238,9 @@ func (c *Cache[K, V]) Clear() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	c.store = map[K]V{}
+	err := c.storeNoLock(false)
 	if c.logger != nil {
-		c.logger.Debug("cache clear")
+		c.logger.Debug("cache clear", "error", err)
 	}
 }
 
@@ -172,4 +256,78 @@ func (c *Cache[K, V]) Keys() []K {
 		c.logger.Debug("returning cache keys", "keys", keys, "size", len(keys))
 	}
 	return keys
+}
+
+// storeNoLock persists the cache without acquiring the read lock,
+// which should be held by the caller; not acquiring the lock before
+// calling this method can result in unexpected behaviour.
+func (c *Cache[K, V]) storeNoLock(force bool) error {
+	if c.logger != nil {
+		c.logger.Debug("storing the cache without acquiring the lock")
+	}
+
+	if !force && !c.policy.Trigger() {
+		if c.logger != nil {
+			c.logger.Debug("neither policy not user requie the cache to be stored")
+
+		}
+		return nil
+	}
+
+	data, err := c.encoding.Encode(c.store)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("error encoding cache", "error", err)
+		}
+		return err
+	}
+
+	err = c.persistence.Write(data)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("error persisting cache", "error", err)
+		}
+		return err
+	}
+
+	if c.logger != nil {
+		c.logger.Debug("cache stored with no lock acquired")
+	}
+	return nil
+}
+
+// loadNoLock read back the cache without acquiring the write lock,
+// which should be held by the caller; not acquiring the lock before
+// calling this method can result in unexpected behaviour.
+func (c *Cache[K, V]) loadNoLock() error {
+	if c.logger != nil {
+		c.logger.Debug("loading the cache without acquiring the lock")
+	}
+
+	data, err := c.persistence.Read()
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("error reading cache data from persistence", "error", err)
+		}
+		return err
+	}
+
+	if c.logger != nil {
+		c.logger.Debug("data read, decoding...")
+	}
+
+	m, err := c.encoding.Decode((data))
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("error decoding the cache from data", "error", err)
+		}
+		return err
+	}
+
+	c.store = m
+
+	if c.logger != nil {
+		c.logger.Debug("cache loaded with no lock acquired")
+	}
+	return nil
 }
