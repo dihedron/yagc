@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"encoding/json"
 
+	"github.com/BurntSushi/toml"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,7 +29,7 @@ func (j *JSON[K, V]) Encode(data map[K]V) ([]byte, error) {
 }
 
 // Decode decodes cache data from JSON format.
-func (j *JSON[K, V]) Decode(data []byte) (map[K]V, error) {
+func (*JSON[K, V]) Decode(data []byte) (map[K]V, error) {
 	m := map[K]V{}
 	err := json.Unmarshal(data, &m)
 	return m, err
@@ -38,14 +39,37 @@ func (j *JSON[K, V]) Decode(data []byte) (map[K]V, error) {
 type YAML[K comparable, V any] struct{}
 
 // Encode encodes cache data in YAML format.
-func (y *YAML[K, V]) Encode(data map[K]V) ([]byte, error) {
+func (*YAML[K, V]) Encode(data map[K]V) ([]byte, error) {
 	return yaml.Marshal(data)
 }
 
 // Decode decodes cache data from YAML format.
-func (y *YAML[K, V]) Decode(data []byte) (map[K]V, error) {
+func (*YAML[K, V]) Decode(data []byte) (map[K]V, error) {
 	m := map[K]V{}
 	err := yaml.Unmarshal(data, &m)
+	return m, err
+}
+
+// TOML encodes/decodes cache data in TOML format.
+type TOML[K comparable, V any] struct {
+	buffer  bytes.Buffer
+	encoder *toml.Encoder
+}
+
+// Encode encodes cache data in TOML format.
+func (t *TOML[K, V]) Encode(data map[K]V) ([]byte, error) {
+	t.buffer.Reset()
+	if t.encoder == nil {
+		t.encoder = toml.NewEncoder(&t.buffer)
+	}
+	err := t.encoder.Encode(data)
+	return t.buffer.Bytes(), err
+}
+
+// Decode decodes cache data from TOML format.
+func (*TOML[K, V]) Decode(data []byte) (map[K]V, error) {
+	m := map[K]V{}
+	_, err := toml.Decode(string(data), &m)
 	return m, err
 }
 
